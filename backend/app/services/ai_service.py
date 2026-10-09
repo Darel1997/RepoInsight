@@ -1,5 +1,7 @@
 """
-AI service — uses Anthropic Claude for all intelligence features.
+AI service — routes every intelligence feature through one provider chain:
+free Google Gemini first, free Groq as fallback, then Claude / OpenAI if
+their (paid) keys are configured. Order is set by AI_PROVIDER_ORDER.
 
 Performance notes (read this before touching token budgets):
 
@@ -21,8 +23,8 @@ loop. All public methods on `AIService` have an `async` counterpart
 backward compatibility but they internally call the async path with
 `asyncio.run` if the loop is free.
 
-Hard timeout: every Claude call is wrapped in a 30-second timeout. If
-the model doesn't respond by then, we raise `AIRequestTimeout` so the
+Timeouts: each provider call gets 25 seconds; the whole fallback chain
+gets 60. If nothing answers by then, we raise `AIRequestTimeout` so the
 caller can show an actionable error instead of hanging forever.
 """
 
@@ -92,47 +94,82 @@ def _budget_for(feature_key: str) -> FeatureBudget:
     return _FEATURE_BUDGETS.get(feature_key, _FEATURE_BUDGETS["_default"])
 
 
-def _resolve_model(model_alias: str) -> str:
-    """Map an alias ('haiku', 'sonnet') to the configured model id."""
-    if model_alias == "haiku":
+def _resolve_model(model_alias: str, provider: str = "claude") -> str:
+    """
+    Map an alias ('haiku' = fast, 'sonnet' = higher quality) to the model id
+    configured for the given provider.
+    """
+    fast = model_alias == "haiku"
+    if provider == "gemini":
+        return settings.GEMINI_FAST_MODEL if fast else settings.GEMINI_MODEL
+    if provider == "groq":
+        return settings.GROQ_FAST_MODEL if fast else settings.GROQ_MODEL
+    if provider == "openai":
+        return settings.OPENAI_MODEL
+    if fast:
         return getattr(settings, "ANTHROPIC_HAIKU_MODEL", "claude-haiku-4-5-20251001")
     return settings.ANTHROPIC_MODEL  # sonnet / configured default
 
 
 # ─────────────────────────────────────────────────────────────────
 # Provider routing
+#
+# Providers are tried in order. The free ones (Gemini, Groq) come first so a
+# public demo can run at $0. If a provider fails — rate limit hit, outage,
+# timeout — the next configured provider gets the same request. Paid
+# providers (Claude, OpenAI) are only used if their keys are set.
 # ─────────────────────────────────────────────────────────────────
 
 class AIRequestTimeout(RuntimeError):
     """Raised when an AI request exceeds its wall-clock budget."""
 
 
-# Shared executor for blocking SDK calls. Pool size tuned for typical
-# free-tier Anthropic rate limits (5 concurrent requests).
+# Shared executor for blocking SDK calls.
 _EXECUTOR = ThreadPoolExecutor(max_workers=5, thread_name_prefix="ai-")
-_HARD_TIMEOUT_SEC = 30
+# Per-provider timeout, and the overall budget for the whole fallback chain
+# (long enough for one provider to time out and the next one to answer).
+_PROVIDER_TIMEOUT_SEC = 25
+_HARD_TIMEOUT_SEC = 60
+
+_PLACEHOLDER_KEYS = {
+    "", "not-set", "sk-placeholder-replace-me", "sk-your-openai-key",
+    "your_anthropic_api_key", "your_gemini_api_key", "your_groq_api_key",
+}
+
+_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+_GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+
+
+def _has_key(value: Optional[str]) -> bool:
+    return bool(value) and value.strip() not in _PLACEHOLDER_KEYS
+
+
+def _get_providers() -> List[str]:
+    """All configured providers, in the order they should be tried."""
+    available = {
+        "gemini": _has_key(settings.GEMINI_API_KEY),
+        "groq": _has_key(settings.GROQ_API_KEY),
+        "claude": _has_key(settings.ANTHROPIC_API_KEY),
+        "openai": _has_key(settings.OPENAI_API_KEY),
+    }
+    order = [p.strip().lower() for p in settings.AI_PROVIDER_ORDER.split(",") if p.strip()]
+    # Any configured provider missing from AI_PROVIDER_ORDER is appended last.
+    for p in available:
+        if p not in order:
+            order.append(p)
+    return [p for p in order if available.get(p)]
 
 
 def _get_provider() -> Optional[str]:
-    """
-    Returns the name of the available AI provider, or None.
-    Prefers Claude.
-    """
-    if settings.ANTHROPIC_API_KEY and settings.ANTHROPIC_API_KEY != "not-set":
-        return "claude"
-    if settings.OPENAI_API_KEY and settings.OPENAI_API_KEY not in (
-        "not-set",
-        "sk-placeholder-replace-me",
-        "sk-your-openai-key",
-    ):
-        return "openai"
-    return None
+    """The first configured provider, or None. Kept for existing callers."""
+    providers = _get_providers()
+    return providers[0] if providers else None
 
 
 def _chat_claude_sync(system: str, messages: list, *, model: str, max_tokens: int, temperature: float) -> str:
     import anthropic
 
-    client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY, timeout=_HARD_TIMEOUT_SEC)
+    client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY, timeout=_PROVIDER_TIMEOUT_SEC)
     response = client.messages.create(
         model=model,
         max_tokens=max_tokens,
@@ -143,18 +180,81 @@ def _chat_claude_sync(system: str, messages: list, *, model: str, max_tokens: in
     return response.content[0].text.strip()
 
 
-def _chat_openai_sync(system: str, messages: list, *, model: str, max_tokens: int, temperature: float) -> str:
+def _chat_openai_compatible_sync(
+    system: str, messages: list, *, api_key: str, base_url: Optional[str],
+    model: str, max_tokens: int, temperature: float, extra: Optional[dict] = None,
+) -> str:
+    """OpenAI, Gemini and Groq all speak the OpenAI chat-completions format."""
     from openai import OpenAI
 
-    client = OpenAI(api_key=settings.OPENAI_API_KEY, timeout=_HARD_TIMEOUT_SEC)
+    # max_retries=0: on a rate limit we'd rather move to the next provider
+    # immediately than sit in the SDK's backoff loop.
+    client = OpenAI(api_key=api_key, base_url=base_url, timeout=_PROVIDER_TIMEOUT_SEC, max_retries=0)
     full_messages = [{"role": "system", "content": system}] + messages
     response = client.chat.completions.create(
         model=model,
         temperature=temperature,
         messages=full_messages,
         max_tokens=max_tokens,
+        **(extra or {}),
     )
-    return response.choices[0].message.content.strip()
+    content = response.choices[0].message.content
+    if not content:
+        raise RuntimeError(f"{model} returned an empty response")
+    return content.strip()
+
+
+def _call_provider(provider: str, system: str, messages: list, *, model_alias: str,
+                   max_tokens: int, temperature: float) -> str:
+    model = _resolve_model(model_alias, provider)
+    if provider == "claude":
+        return _chat_claude_sync(system, messages, model=model, max_tokens=max_tokens, temperature=temperature)
+    if provider == "gemini":
+        extra = {}
+        if settings.GEMINI_REASONING_EFFORT:
+            extra["reasoning_effort"] = settings.GEMINI_REASONING_EFFORT
+        # Gemini's "thinking" tokens count toward max_tokens, so give it
+        # headroom or long answers get cut off mid-sentence.
+        return _chat_openai_compatible_sync(
+            system, messages, api_key=settings.GEMINI_API_KEY, base_url=_GEMINI_BASE_URL,
+            model=model, max_tokens=max_tokens + 2048, temperature=temperature, extra=extra,
+        )
+    if provider == "groq":
+        return _chat_openai_compatible_sync(
+            system, messages, api_key=settings.GROQ_API_KEY, base_url=_GROQ_BASE_URL,
+            model=model, max_tokens=max_tokens, temperature=temperature,
+        )
+    return _chat_openai_compatible_sync(
+        system, messages, api_key=settings.OPENAI_API_KEY, base_url=None,
+        model=model, max_tokens=max_tokens, temperature=temperature,
+    )
+
+
+def _chat_with_fallback(system: str, messages: list, *, feature_key: str, temperature: float) -> str:
+    providers = _get_providers()
+    if not providers:
+        raise RuntimeError(
+            "No AI provider configured. Set GEMINI_API_KEY and/or GROQ_API_KEY "
+            "(both free) in your .env file."
+        )
+
+    budget = _budget_for(feature_key)
+    last_error: Optional[Exception] = None
+    for provider in providers:
+        try:
+            return _call_provider(
+                provider, system, messages,
+                model_alias=budget.model, max_tokens=budget.max_tokens, temperature=temperature,
+            )
+        except Exception as e:  # rate limit, outage, timeout, bad model id…
+            last_error = e
+            logger.warning(
+                "AI provider %s failed for feature=%s (%s: %s); trying next provider",
+                provider, feature_key, type(e).__name__, str(e)[:200],
+            )
+    raise RuntimeError(
+        "All AI providers failed. The free daily limits may have been reached — try again later."
+    ) from last_error
 
 
 def _chat(
@@ -168,28 +268,8 @@ def _chat(
     Synchronous chat — kept for callers that haven't migrated to the async API.
     Internally still uses the configured per-feature budget.
     """
-    provider = _get_provider()
-    if not provider:
-        raise RuntimeError(
-            "No AI provider configured. Set ANTHROPIC_API_KEY or OPENAI_API_KEY in your .env file."
-        )
-
-    budget = _budget_for(feature_key)
     messages = [{"role": "user", "content": user}]
-
-    if provider == "claude":
-        return _chat_claude_sync(
-            system, messages,
-            model=_resolve_model(budget.model),
-            max_tokens=budget.max_tokens,
-            temperature=temperature,
-        )
-    return _chat_openai_sync(
-        system, messages,
-        model=settings.OPENAI_MODEL,
-        max_tokens=budget.max_tokens,
-        temperature=temperature,
-    )
+    return _chat_with_fallback(system, messages, feature_key=feature_key, temperature=temperature)
 
 
 async def _chat_async(
@@ -226,26 +306,7 @@ def _chat_with_history(
     temperature: float = 0.3,
 ) -> str:
     """Multi-turn conversation — also runs through the per-feature budget."""
-    provider = _get_provider()
-    if not provider:
-        raise RuntimeError(
-            "No AI provider configured. Set ANTHROPIC_API_KEY or OPENAI_API_KEY in your .env file."
-        )
-
-    budget = _budget_for(feature_key)
-    if provider == "claude":
-        return _chat_claude_sync(
-            system, messages,
-            model=_resolve_model(budget.model),
-            max_tokens=budget.max_tokens,
-            temperature=temperature,
-        )
-    return _chat_openai_sync(
-        system, messages,
-        model=settings.OPENAI_MODEL,
-        max_tokens=budget.max_tokens,
-        temperature=temperature,
-    )
+    return _chat_with_fallback(system, messages, feature_key=feature_key, temperature=temperature)
 
 
 def _strip_fences(raw: str) -> str:

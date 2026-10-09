@@ -117,8 +117,16 @@ async def run_selfcheck(engine: AsyncEngine) -> dict:
         results["warnings"].append(f"column_check_failed: {e}")
 
     # ── Check 5: Required env vars (warnings only — features may degrade) ─
+    from app.services.ai_service import _get_providers
+    ai_providers = _get_providers()
+    if ai_providers:
+        results["checks"].append({"name": "ai.providers", "status": "ok", "detail": ",".join(ai_providers)})
+    else:
+        results["warnings"].append(
+            "no_ai_provider — set GEMINI_API_KEY and/or GROQ_API_KEY; AI features won't work"
+        )
+
     optional_envs = {
-        "ANTHROPIC_API_KEY":   "AI features (chat, audits, lab features) won't work",
         "GITHUB_CLIENT_ID":     "GitHub OAuth sign-in will return 501",
         "GITHUB_CLIENT_SECRET": "GitHub OAuth sign-in will return 501",
     }

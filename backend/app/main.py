@@ -61,8 +61,12 @@ def _assert_production_safety() -> None:
             "JWT_SECRET is missing or set to a known default. "
             "Generate one with: openssl rand -hex 32"
         )
-    if not settings.ANTHROPIC_API_KEY and not settings.OPENAI_API_KEY:
-        problems.append("No AI provider configured (ANTHROPIC_API_KEY / OPENAI_API_KEY).")
+    from app.services.ai_service import _get_providers
+    if not _get_providers():
+        problems.append(
+            "No AI provider configured. Set GEMINI_API_KEY and/or GROQ_API_KEY "
+            "(free), or ANTHROPIC_API_KEY / OPENAI_API_KEY."
+        )
 
     if settings.FRONTEND_URL.startswith("http://") and "localhost" not in settings.FRONTEND_URL:
         problems.append(

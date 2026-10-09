@@ -1,0 +1,21 @@
+# Public entry point. Caddy gets and renews a free HTTPS certificate
+# from Let's Encrypt automatically for the domain in $DOMAIN.
+
+{$DOMAIN} {
+	encode gzip
+
+	# Backend API
+	handle /api/* {
+		reverse_proxy api:8000
+	}
+	# Public liveness check only. /health/detail (internal diagnostics) is
+	# deliberately not exposed; read it from the server instead (see docs).
+	handle /health {
+		reverse_proxy api:8000
+	}
+
+	# Everything else is the Next.js frontend
+	handle {
+		reverse_proxy frontend:3000
+	}
+}

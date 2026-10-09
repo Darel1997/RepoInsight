@@ -52,12 +52,31 @@ class Settings(BaseSettings):
     # Default suits local dev; production deploys should override via env.
     BACKEND_URL: str = "http://localhost:8000"
 
-    # ── OpenAI (optional fallback) ────────────────────────
+    # ── AI provider order ────────────────────────────────
+    # Providers are tried left to right; a failure (rate limit, outage)
+    # falls through to the next one. Only providers with a key are used.
+    AI_PROVIDER_ORDER: str = "gemini,groq,claude,openai"
+
+    # ── Google Gemini (free tier — https://aistudio.google.com/apikey) ──
+    GEMINI_API_KEY: str = ""
+    # Quality model (docs, onboarding, chat) and fast model (audits, JSON).
+    GEMINI_MODEL: str = "gemini-3.6-flash"
+    GEMINI_FAST_MODEL: str = "gemini-3.5-flash-lite"
+    # Keeps Gemini's built-in "thinking" short so responses stay fast.
+    # Set to empty to use the model's default.
+    GEMINI_REASONING_EFFORT: str = "low"
+
+    # ── Groq (free tier — https://console.groq.com/keys) ──
+    GROQ_API_KEY: str = ""
+    GROQ_MODEL: str = "llama-3.3-70b-versatile"
+    GROQ_FAST_MODEL: str = "llama-3.3-70b-versatile"
+
+    # ── OpenAI (optional, paid) ───────────────────────────
     OPENAI_API_KEY: str = ""
     OPENAI_MODEL: str = "gpt-4o"
     OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small"
 
-    # ── Anthropic Claude (preferred) ──────────────────────
+    # ── Anthropic Claude (optional, paid API credits) ─────
     ANTHROPIC_API_KEY: str = ""
     # Default model — used for prose-heavy features (docs, onboarding guide).
     ANTHROPIC_MODEL: str = "claude-sonnet-4-6"

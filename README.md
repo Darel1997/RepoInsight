@@ -11,7 +11,7 @@ Index any GitHub repository, then chat with it, document it, audit it, and ship 
 [![Python 3.11](https://img.shields.io/badge/Python-3.11-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org)
 [![Next.js 14](https://img.shields.io/badge/Next.js-14-000?style=flat-square&logo=nextdotjs&logoColor=white)](https://nextjs.org)
 [![Docker Ready](https://img.shields.io/badge/Docker-Ready-2496ED?style=flat-square&logo=docker&logoColor=white)](https://www.docker.com)
-[![Built with Claude](https://img.shields.io/badge/AI-Anthropic_Claude-d97757?style=flat-square)](https://anthropic.com)
+[![AI: Gemini + Groq](https://img.shields.io/badge/AI-Gemini_%2B_Groq-4285F4?style=flat-square)](#configuration)
 
 [Documentation](docs/) · [Changelog](https://darel-rodriguez.com/repoinsight/changelog) · [Report a vulnerability](#responsible-disclosure)
 
@@ -95,7 +95,7 @@ endpoint under `backend/app/api/endpoints/`:
                            │
                 ┌──────────▼──────────┐
                 │   GitHub REST API   │  (read-only repo access)
-                │   Anthropic Claude  │  (zero-retention inference)
+                │  Gemini → Groq LLMs │  (free tiers, automatic fallback)
                 └─────────────────────┘
 ```
 
@@ -111,12 +111,18 @@ endpoint under `backend/app/api/endpoints/`:
 
 For every user question, RepoInsight retrieves the top-k most relevant chunks, sends only those chunks to the model (never the whole repo), and renders the response with inline citations back to the file and line range.
 
-Two Claude models are used, selected per feature in `app/core/config.py`:
+Every AI call goes through one provider chain in `app/services/ai_service.py`.
+Providers are tried in the order set by `AI_PROVIDER_ORDER` (default
+`gemini,groq,claude,openai`); if one fails or hits its free daily limit, the
+same request goes to the next. Only providers with a key are used.
 
-| Setting | Default | Used for |
+Each feature asks for either a **quality** or a **fast** model:
+
+| Provider | Quality model (docs, onboarding, chat, diagrams) | Fast model (audits, security scans, tasks) |
 | --- | --- | --- |
-| `ANTHROPIC_MODEL` | `claude-sonnet-4-6` | Prose-heavy work — docs, onboarding guides, chat. |
-| `ANTHROPIC_HAIKU_MODEL` | `claude-haiku-4-5-20251001` | Short structured output — audits, security scans, task generation, diagrams. |
+| Google Gemini *(free)* | `GEMINI_MODEL` = `gemini-3.6-flash` | `GEMINI_FAST_MODEL` = `gemini-3.5-flash-lite` |
+| Groq *(free)* | `GROQ_MODEL` = `llama-3.3-70b-versatile` | `GROQ_FAST_MODEL` = `llama-3.3-70b-versatile` |
+| Anthropic *(paid, optional)* | `ANTHROPIC_MODEL` = `claude-sonnet-4-6` | `ANTHROPIC_HAIKU_MODEL` = `claude-haiku-4-5-20251001` |
 
 ---
 
@@ -129,7 +135,7 @@ The fastest path is `docker compose up`. It boots the frontend, API, workers, Po
 | Tool | Why | Install |
 | --- | --- | --- |
 | Docker Desktop | Runs every service in a container | https://www.docker.com/products/docker-desktop |
-| Anthropic API key | Powers all AI features | https://console.anthropic.com/settings/keys |
+| Free Gemini and/or Groq API key | Powers all AI features | https://aistudio.google.com/apikey · https://console.groq.com/keys |
 | GitHub OAuth app *(optional)* | Sign-in with GitHub + private repo access | https://github.com/settings/developers |
 
 > If you skip the GitHub OAuth app you can still register with email/password and analyze any **public** repository.
@@ -140,7 +146,7 @@ The fastest path is `docker compose up`. It boots the frontend, API, workers, Po
 git clone https://github.com/Darel1997/RepoInsight.git
 cd RepoInsight
 
-cp .env.example .env       # then edit .env and add your API key
+cp .env.example .env       # then edit .env and add your Gemini / Groq key
 docker compose up --build  # build and start every service
 ```
 
@@ -188,7 +194,9 @@ Every environment variable lives in `.env.example` with comments. The ones that 
 
 | Variable | Required | Purpose |
 | --- | --- | --- |
-| `ANTHROPIC_API_KEY` | ✅ * | Powers chat, audits, security scanning, and every AI artifact. |
+| `GEMINI_API_KEY` | ✅ * | Free Google Gemini key. First choice for every AI feature. |
+| `GROQ_API_KEY` | ✅ * | Free Groq key. Answers when Gemini fails or hits its daily limit. |
+| `AI_PROVIDER_ORDER` | Optional | Order providers are tried in. Defaults to `gemini,groq,claude,openai`. |
 | `JWT_SECRET` | ✅ | Signs auth tokens. Use a 32-byte random string. |
 | `DATABASE_URL` / `DATABASE_URL_SYNC` | ✅ | Async and sync Postgres connection strings. The defaults work inside Docker. |
 | `REDIS_URL` | ✅ | Used by Celery and the rate limiter. The default works inside Docker. |
@@ -196,21 +204,21 @@ Every environment variable lives in `.env.example` with comments. The ones that 
 | `ENCRYPTION_KEY_ROTATION` | Optional | Comma-separated older keys, accepted for decryption only, so you can rotate without invalidating existing tokens. |
 | `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | Optional | GitHub OAuth app credentials. Required for private repos. |
 | `GITHUB_WEBHOOK_SECRET` | Optional | Enables HMAC verification on incoming webhooks. Leave blank in dev. |
-| `OPENAI_API_KEY` | Optional | Fallback AI provider — see the note below. |
+| `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | Optional | Paid providers, used only if set. API usage is billed separately from any Claude.ai or ChatGPT subscription. |
 | `SLACK_CLIENT_ID` / `SLACK_CLIENT_SECRET` / `SLACK_SIGNING_SECRET` | Optional | Slack app credentials. The Slack feature is simply unavailable if unset. |
 | `RATE_LIMIT_PER_MINUTE` | Optional | Defaults to 60. |
 | `TRUSTED_PROXIES` | Optional | Comma-separated IPs/CIDRs allowed to set `X-Forwarded-For`. Empty (the default) trusts none — correct for local dev. |
 | `NEXT_PUBLIC_API_URL` | Optional | Defaults to `http://localhost:8000`. |
 
-\* **At least one** of `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` must be set. The
-startup check in `app/main.py` reports a problem if neither is present.
+\* **At least one** AI key must be set — set both free ones so the app keeps
+working if one hits its daily limit. In production the startup check in
+`app/main.py` refuses to boot without any.
 
-> **On AI providers.** Claude is the default and the recommended path — the
-> prompts and model routing are tuned for it. OpenAI is supported as a fallback:
-> `app/services/ai_service.py` selects it when `OPENAI_API_KEY` is set to a real
-> value, and `OPENAI_MODEL` defaults to `gpt-4o`. Embeddings never touch either
-> provider; they run locally through `sentence-transformers`, so
-> `OPENAI_EMBEDDING_MODEL` is vestigial and setting it changes nothing.
+> **On AI providers.** The free tiers have daily request limits, and Google may
+> use free-tier Gemini prompts to improve its models — fine for public repos,
+> worth knowing for private code. Embeddings never touch any provider; they run
+> locally through `sentence-transformers`, so `OPENAI_EMBEDDING_MODEL` is
+> vestigial and setting it changes nothing.
 
 ### Billing (optional)
 
@@ -277,7 +285,7 @@ cd frontend && npx playwright test
 | --- | --- | --- |
 | Frontend | Next.js 14 (App Router), React, Tailwind CSS, Recharts, Mermaid | First-class SSR, file-based routing, mature ecosystem. |
 | Backend | Python 3.11, FastAPI, SQLAlchemy 2 | Async-first, type-safe, automatic OpenAPI. |
-| AI / RAG | Anthropic Claude (OpenAI optional), sentence-transformers, ChromaDB | Zero-retention inference, local embeddings, no data egress for indexing. |
+| AI / RAG | Google Gemini + Groq with automatic fallback (Claude / OpenAI optional), sentence-transformers, ChromaDB | Runs at $0 on free tiers; local embeddings, no data egress for indexing. |
 | Queue | Celery + Redis | Battle-tested for long-running indexing jobs. |
 | Database | PostgreSQL | Relational metadata + JSON columns for AI artifacts. |
 | Containers | Docker Compose | One command to run everything locally. |
@@ -319,12 +327,15 @@ RepoInsight/
 │   └── package.json
 │
 ├── docs/
+│   ├── oracle-free-deployment.md  # Host it live for $0
 │   └── aws-deployment.md    # Full AWS walkthrough
 │
 ├── .github/workflows/       # ci.yml, security-audit.yml
 ├── assets/                  # Logo and README artwork
 ├── .env.example
-├── docker-compose.yml
+├── deploy/                  # Caddyfile + one-shot server setup script
+├── docker-compose.yml       # Local development
+├── docker-compose.prod.yml  # Production (single server, HTTPS)
 ├── LICENSE
 └── README.md
 ```
@@ -333,7 +344,11 @@ RepoInsight/
 
 ## Deployment
 
-A complete walkthrough for AWS (ECS Fargate + RDS + ElastiCache) lives in
+**Free hosting.** [`docs/oracle-free-deployment.md`](docs/oracle-free-deployment.md)
+runs the whole stack on one Oracle Cloud *Always Free* server with automatic
+HTTPS, using `docker-compose.prod.yml` and `deploy/setup-server.sh`. Cost: $0.
+
+**Team scale.** A complete walkthrough for AWS (ECS Fargate + RDS + ElastiCache) lives in
 [`docs/aws-deployment.md`](docs/aws-deployment.md). It covers IAM policies, task
 definitions, ALB rules, Route 53, monitoring, and a cost estimate.
 

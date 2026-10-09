@@ -1,0 +1,137 @@
+# Production stack for a single server (e.g. Oracle Cloud Always Free).
+#
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# Differences from docker-compose.yml (local dev):
+#   • Only Caddy is reachable from the internet (ports 80/443, automatic HTTPS).
+#     Postgres, Redis, Chroma and the API have no published ports.
+#   • Frontend is a production build (`next start`), API runs without --reload,
+#     and source code is not bind-mounted.
+#   • Every service restarts automatically, including after a server reboot.
+#
+# Reads DOMAIN and POSTGRES_PASSWORD (and everything else) from .env.
+# deploy/setup-server.sh generates that file for you.
+
+x-backend: &backend
+  build: ./backend
+  restart: unless-stopped
+  env_file: .env
+  environment:
+    APP_ENV: production
+    DEBUG: "false"
+    DATABASE_URL: postgresql+asyncpg://repoinsight:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/repoinsight
+    DATABASE_URL_SYNC: postgresql://repoinsight:${POSTGRES_PASSWORD}@db:5432/repoinsight
+    REDIS_URL: redis://redis:6379/0
+    CHROMA_HOST: chroma
+    CHROMA_PORT: "8000"
+    FRONTEND_URL: https://${DOMAIN:?set DOMAIN in .env}
+    BACKEND_URL: https://${DOMAIN}
+    # Only Caddy (on this private network) may set X-Forwarded-For.
+    TRUSTED_PROXIES: 172.28.0.0/16
+  depends_on:
+    db:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    chroma:
+      condition: service_healthy
+
+services:
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - frontend
+      - api
+
+  db:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: repoinsight
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: repoinsight
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U repoinsight"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  chroma:
+    image: chromadb/chroma:0.5.23
+    restart: unless-stopped
+    volumes:
+      - chromadata:/chroma/chroma
+    environment:
+      IS_PERSISTENT: "TRUE"
+      ANONYMIZED_TELEMETRY: "FALSE"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  api:
+    <<: *backend
+    command: >
+      uvicorn app.main:app --host 0.0.0.0 --port 8000
+      --proxy-headers --forwarded-allow-ips=*
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  worker:
+    <<: *backend
+    command: celery -A app.workers.tasks.celery_app worker --loglevel=info --concurrency=2
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.prod
+      args:
+        NEXT_PUBLIC_API_URL: https://${DOMAIN}
+        NEXT_PUBLIC_SITE_URL: https://${DOMAIN}
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  redisdata:
+  chromadata:
+  caddy_data:
+  caddy_config:
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
